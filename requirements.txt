@@ -1,0 +1,10 @@
+Flask
+python-telegram-bot==20.6
+requests
+beautifulsoup4
+lxml
+
+Uncomment the following lines if you decide to implement advanced features:
+playwright==1.45.0 # For headless browser scraping (e.g., dynamic content, stock checks)
+celery==5.3.6 # For a true asynchronous task queue
+redis==5.0.1 # Required if using Celery with Redis or for caching
