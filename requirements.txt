@@ -4,7 +4,7 @@ requests
 beautifulsoup4
 lxml
 
-Uncomment the following lines if you decide to implement advanced features:
+Advanced features for robust scraping and asynchronous tasks
 playwright==1.45.0
 celery==5.3.6
 redis==5.0.1
