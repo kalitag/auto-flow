@@ -10,6 +10,9 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from playwright.async_api import async_playwright, Playwright
+from celery import Celery
+from celery.signals import worker_process_init, worker_process_shutdown
 
 # --- Configuration ---
 # Set up logging for better error visibility in your Render logs
@@ -19,11 +22,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load environment variables for sensitive data.
-# For local testing, you can set these in your shell or a .env file.
 # In Render, configure them directly in your service settings.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8465346144:AAGSHC77UkXVZZTUscbYItvJxgQbBxmFcWo") # Your Telegram Bot Token
 WEBHOOK_URL_BASE = os.getenv("WEBHOOK_URL_BASE", "https://deal-bot-255c.onrender.com/") # Your Render app's URL
 WEBHOOK_PATH = f"/{BOT_TOKEN}" # Telegram webhook path uses the bot token for security
+
+# Redis URL for Celery broker and backend. Set this in Render environment variables.
+# Example: redis://<your-redis-host>:<port>/0
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0") 
 
 # Supported URL shorteners as defined in your plan
 SUPPORTED_SHORTENERS = [
@@ -50,8 +56,65 @@ MEESHO_FALLBACK_PIN = "110001"
 # --- Flask App Initialization ---
 app = Flask(__name__)
 
+# --- Celery App Initialization ---
+# Initialize Celery with Redis as both broker and backend.
+# The `include` argument tells Celery where to find tasks.
+celery_app = Celery(
+    "deal_bot_tasks",
+    broker=REDIS_URL,
+    backend=REDIS_URL,
+    include=['app'] # This tells Celery to look for tasks in this 'app.py' file
+)
+
+# Configure Playwright browser context for each Celery worker process.
+# This ensures each worker has its own browser instance, preventing conflicts.
+# The 'browser_context' will store the Playwright async_api.Playwright object
+# for each worker, allowing multiple tasks to run in parallel.
+playwright_context = {}
+
+@worker_process_init.connect
+def init_playwright(**kwargs):
+    """Initializes Playwright browser context when a Celery worker process starts."""
+    global playwright_context
+    logger.info("Initializing Playwright in Celery worker process.")
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # If event loop is already running (e.g., during testing), run it in a new task
+        asyncio.create_task(_init_playwright_async())
+    else:
+        # If no event loop, run it directly
+        loop.run_until_complete(_init_playwright_async())
+
+async def _init_playwright_async():
+    """Asynchronous Playwright initialization."""
+    global playwright_context
+    try:
+        pw = await async_playwright().start()
+        playwright_context['pw'] = pw
+        playwright_context['browser'] = await pw.chromium.launch(headless=True) # Run in headless mode for production
+        logger.info("Playwright browser launched successfully.")
+    except Exception as e:
+        logger.error(f"Failed to launch Playwright browser: {e}", exc_info=True)
+        # Re-raise to indicate a critical setup failure for the worker
+        raise
+
+@worker_process_shutdown.connect
+def close_playwright(**kwargs):
+    """Closes Playwright browser context when a Celery worker process shuts down."""
+    global playwright_context
+    if 'browser' in playwright_context and playwright_context['browser']:
+        logger.info("Closing Playwright browser in Celery worker process.")
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(playwright_context['browser'].close())
+            asyncio.create_task(playwright_context['pw'].stop())
+        else:
+            loop.run_until_complete(playwright_context['browser'].close())
+            loop.run_until_complete(playwright_context['pw'].stop())
+        logger.info("Playwright browser closed.")
+
+
 # --- Telegram Bot Application Initialization ---
-# This sets up the python-telegram-bot Application instance.
 application = Application.builder().token(BOT_TOKEN).arbitrary_callback_data(True).build()
 
 # --- Utility Functions ---
@@ -94,7 +157,6 @@ async def unshorten_url(short_url: str) -> str:
         return short_url
 
     try:
-        # Using requests.head with allow_redirects=True to get the final URL
         response = requests.head(short_url, allow_redirects=True, timeout=10)
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         final_url = response.url
@@ -123,41 +185,12 @@ def strip_affiliate_tags(url: str) -> str:
     logger.info(f"Stripped affiliate tags from '{url}' to '{cleaned_url}'")
     return cleaned_url
 
-async def fetch_page_content(url: str) -> str | None:
+async def scrape_product_info_playwright(url: str, message_caption: str | None = None) -> dict:
     """
-    Fetches the HTML content of a given URL.
-    This method is suitable for static HTML content.
-    For JavaScript-rendered content (common on modern e-commerce sites),
-    you would need a headless browser (like Playwright or Selenium).
+    Scrapes product title, price, sizes, and pin code information using Playwright.
+    This function handles JavaScript-rendered content.
     """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
-        return response.text
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching content from '{url}': {e}")
-        return None
-
-async def scrape_product_info(url: str, message_caption: str | None = None) -> dict:
-    """
-    Scrapes product title, price, sizes, and pin code information from the given URL.
-    This scraper is designed for speed and basic HTML parsing.
-    
-    IMPORTANT: For dynamic content (e.g., prices/sizes loaded via JS),
-    you would need to integrate a headless browser like Playwright here.
-    Example (simplified):
-    from playwright.async_api import async_playwright
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.goto(url)
-        # Wait for dynamic content to load, e.g., await page.wait_for_selector('div.price')
-        html_content = await page.content()
-        await browser.close()
-    """
+    global playwright_context
     product_info = {
         "title": "N/A",
         "price": "N/A",
@@ -166,131 +199,200 @@ async def scrape_product_info(url: str, message_caption: str | None = None) -> d
         "link": url
     }
 
-    # --- Title Extraction ---
-    # Prioritize the image caption if available, as per your requirements
-    if message_caption:
-        product_info["title"] = message_caption
-        # Basic cleaning: remove extra spaces
-        product_info["title"] = " ".join(product_info["title"].split())
-        # Add basic gender/quantity prefixing if keywords are found in the caption
-        for tag in GENDER_TAGS:
-            if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
-                if not product_info["title"].lower().startswith(tag): # Avoid double prefixing
-                    product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
-                break
-        for tag in QUANTITY_TAGS:
-            if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
-                if not product_info["title"].lower().startswith(tag): # Avoid double prefixing
-                    product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
-                break
-        logger.info(f"Using message caption for title: '{product_info['title']}'")
-    
-    html_content = await fetch_page_content(url)
-    if not html_content:
-        logger.warning(f"Could not fetch content for '{url}'. Cannot scrape further.")
+    if 'browser' not in playwright_context or not playwright_context['browser']:
+        logger.error("Playwright browser is not initialized. Cannot scrape.")
         return product_info
 
-    soup = BeautifulSoup(html_content, 'lxml') # Using lxml parser for speed
-
-    # If title wasn't set from caption, try scraping from the page
-    if product_info["title"] == "N/A":
-        # Try og:title, then title tag, then h1 for product title
-        title_meta = soup.find('meta', property='og:title')
-        if title_meta and title_meta.get('content'):
-            product_info["title"] = title_meta['content']
-        else:
-            title_tag = soup.find('title')
-            if title_tag and title_tag.string:
-                product_info["title"] = title_tag.string
-            else:
-                h1_tag = soup.find('h1')
-                if h1_tag and h1_tag.string:
-                    product_info["title"] = h1_tag.string
+    try:
+        page = await playwright_context['browser'].new_page()
+        # Set a reasonable timeout for page load
+        await page.goto(url, wait_until='domcontentloaded', timeout=60000) # 60 seconds
         
-        if product_info["title"] != "N/A":
-            # Basic cleaning for scraped title: remove common website suffixes/noise
-            product_info["title"] = re.sub(r'\|\s*Amazon\.in|\s*Online at Best Price|\s*-\s*Buy Online.*', '', product_info["title"], flags=re.IGNORECASE).strip()
-            # Ensure gender/quantity tags are added if identified and not already present from scraping
-            found_gender = False
+        # Wait for common product elements to be present (e.g., price, title)
+        # Adjust selectors based on common e-commerce patterns
+        await page.wait_for_selector('body', state='attached', timeout=30000) # Wait for body to be attached (general page readiness)
+
+        # Get the full HTML content after dynamic rendering
+        html_content = await page.content()
+        soup = BeautifulSoup(html_content, 'lxml')
+
+        await page.close() # Close the page after scraping
+        
+        # --- Title Extraction ---
+        if message_caption:
+            product_info["title"] = message_caption
+            product_info["title"] = " ".join(product_info["title"].split())
+            # Add basic gender/quantity prefixing if keywords are found in the caption
             for tag in GENDER_TAGS:
                 if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
-                    product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
-                    found_gender = True
-                    break # Only add one gender tag
-            if found_gender: # If gender was added, remove it from the raw title to avoid duplication later
-                for tag in GENDER_TAGS:
-                    product_info["title"] = re.sub(r'\b' + re.escape(tag) + r'\b', '', product_info["title"], flags=re.IGNORECASE).strip()
-
-            found_quantity = False
+                    if not product_info["title"].lower().startswith(tag):
+                        product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
+                    break
             for tag in QUANTITY_TAGS:
                 if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
-                    product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
-                    found_quantity = True
-                    break # Only add one quantity tag
-            if found_quantity: # If quantity was added, remove it from the raw title
-                 for tag in QUANTITY_TAGS:
-                    product_info["title"] = re.sub(r'\b' + re.escape(tag) + r'\b', '', product_info["title"], flags=re.IGNORECASE).strip()
+                    if not product_info["title"].lower().startswith(tag):
+                        product_info["title"] = f"{tag.capitalize()} {product_info['title']}"
+                    break
+            logger.info(f"Using message caption for title: '{product_info['title']}'")
+        
+        if product_info["title"] == "N/A":
+            # Try og:title, then title tag, then h1 for product title
+            title_meta = soup.find('meta', property='og:title')
+            if title_meta and title_meta.get('content'):
+                product_info["title"] = title_meta['content']
+            else:
+                title_tag = soup.find('title')
+                if title_tag and title_tag.string:
+                    product_info["title"] = title_tag.string
+                else:
+                    h1_tag = soup.find('h1')
+                    if h1_tag and h1_tag.string:
+                        product_info["title"] = h1_tag.string
+            
+            if product_info["title"] != "N/A":
+                product_info["title"] = re.sub(r'\|\s*Amazon\.in|\s*Online at Best Price|\s*-\s*Buy Online.*', '', product_info["title"], flags=re.IGNORECASE).strip()
+                final_prefixes = []
+                for tag in GENDER_TAGS:
+                    if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
+                        final_prefixes.append(tag.capitalize())
+                        product_info["title"] = re.sub(r'\b' + re.escape(tag) + r'\b', '', product_info["title"], flags=re.IGNORECASE).strip()
+                        break
+                for tag in QUANTITY_TAGS:
+                    if re.search(r'\b' + re.escape(tag) + r'\b', product_info["title"], re.IGNORECASE):
+                        final_prefixes.append(tag.capitalize())
+                        product_info["title"] = re.sub(r'\b' + re.escape(tag) + r'\b', '', product_info["title"], flags=re.IGNORECASE).strip()
+                        break
+                product_info["title"] = " ".join(final_prefixes + [product_info["title"]]).strip()
 
         logger.info(f"Scraped title: '{product_info['title']}'")
 
-    # --- Price Scraping ---
-    # Search for elements containing price patterns or common price class names
-    price_candidates = soup.find_all(text=PRICE_PATTERN)
-    if not price_candidates: # If regex didn't find, try common price classes
-        price_candidates.extend(soup.find_all(class_=re.compile(r'price|product-price|offer-price|final-price|selling-price|current-price', re.IGNORECASE)))
-    
-    for candidate in price_candidates:
-        price_match = PRICE_PATTERN.search(str(candidate))
-        if price_match:
-            # Extract just the digits and remove commas, as per "Output: Only digits, no ₹ symbol"
-            raw_price = price_match.group(1).replace(',', '')
-            product_info["price"] = raw_price
-            logger.info(f"Scraped price: '{product_info['price']}'")
-            break # Found price, stop searching
+        # --- Price Scraping ---
+        price_candidates = soup.find_all(text=PRICE_PATTERN)
+        if not price_candidates:
+            price_candidates.extend(soup.find_all(class_=re.compile(r'price|product-price|offer-price|final-price|selling-price|current-price', re.IGNORECASE)))
+        
+        for candidate in price_candidates:
+            price_match = PRICE_PATTERN.search(str(candidate))
+            if price_match:
+                raw_price = price_match.group(1).replace(',', '')
+                product_info["price"] = raw_price
+                logger.info(f"Scraped price: '{product_info['price']}'")
+                break
 
-    # --- Sizes Scraping ---
-    # This is often dynamic and highly site-specific.
-    # A robust solution requires a headless browser to detect active sizes and stock status.
-    # For now, we'll try to find common span elements that might contain sizes.
-    available_sizes = []
-    # Labels to look for (case-insensitive for comparison, but store original casing)
-    size_labels_list = ["S", "M", "L", "XL", "XXL", "XXXL", "Free Size", "One Size"]
+        # --- Sizes Scraping ---
+        available_sizes = []
+        size_labels_list = ["S", "M", "L", "XL", "XXL", "XXXL", "Free Size", "One Size"]
 
-    # Look for spans or other elements with common size-related classes or attributes
-    size_elements = soup.find_all(lambda tag: tag.name in ['span', 'div', 'li', 'a'] and
-                                   any(cls in (tag.get('class', []) or []) for cls in ['size-label', 'product-size-label', 'size-variant', 'selector-item']) or
-                                   any(attr in tag.attrs for attr in ['data-size', 'data-value']))
+        size_elements = soup.find_all(lambda tag: tag.name in ['span', 'div', 'li', 'a'] and
+                                       any(cls in (tag.get('class', []) or []) for cls in ['size-label', 'product-size-label', 'size-variant', 'selector-item']) or
+                                       any(attr in tag.attrs for attr in ['data-size', 'data-value']))
 
-    for element in size_elements:
-        text = element.get_text(strip=True)
-        if text.upper() in [s.upper() for s in size_labels_list]:
-            # Simple stock check: assume available if not explicitly marked as unavailable/disabled.
-            # Real stock check would look for specific 'disabled', 'unavailable' classes or AJAX calls.
-            if 'unavailable' not in element.get('class', []) and 'disabled' not in element.get('class', []):
-                available_sizes.append(text)
-    
-    if available_sizes:
-        # Deduplicate and sort sizes
-        unique_sizes = sorted(list(set(available_sizes)), key=lambda x: size_labels_list.index(x.upper()) if x.upper() in [s.upper() for s in size_labels_list] else len(size_labels_list))
-        # If all common sizes are found, set to "All" (simplified check)
-        if len(unique_sizes) >= len(size_labels_list) - 2: # heuristic check
-             product_info["sizes"] = "All"
+        for element in size_elements:
+            text = element.get_text(strip=True)
+            if text.upper() in [s.upper() for s in size_labels_list]:
+                if 'unavailable' not in element.get('class', []) and 'disabled' not in element.get('class', []):
+                    available_sizes.append(text)
+        
+        if available_sizes:
+            unique_sizes = sorted(list(set(available_sizes)), key=lambda x: size_labels_list.index(x.upper()) if x.upper() in [s.upper() for s in size_labels_list] else len(size_labels_list))
+            if len(unique_sizes) >= len(size_labels_list) - 2:
+                 product_info["sizes"] = "All"
+            else:
+                product_info["sizes"] = ", ".join(unique_sizes)
         else:
-            product_info["sizes"] = ", ".join(unique_sizes)
-    else:
-        product_info["sizes"] = "Not Found" # This will cause the line to be skipped in output
+            product_info["sizes"] = "Not Found"
 
-    logger.info(f"Scraped sizes: '{product_info['sizes']}'")
+        logger.info(f"Scraped sizes: '{product_info['sizes']}'")
 
-    # --- Pin Code for Meesho ---
-    if "meesho.com" in url:
-        # As per requirement, use fallback pin for Meesho if not found on page (complex to scrape without JS)
-        product_info["pin"] = MEESHO_FALLBACK_PIN
-        logger.info(f"Detected Meesho link, applying fallback pin: '{product_info['pin']}'")
-    else:
-        product_info["pin"] = "N/A" # Not applicable for other sites
+        # --- Pin Code for Meesho ---
+        if "meesho.com" in url:
+            # For Meesho, using Playwright, we could try to fill the pin code field if it's visible
+            # or make an XHR request if the structure is known. For simplicity, we stick to fallback for now.
+            product_info["pin"] = MEESHO_FALLBACK_PIN
+            logger.info(f"Detected Meesho link, applying fallback pin: '{product_info['pin']}'")
+        else:
+            product_info["pin"] = "N/A"
 
+    except Exception as e:
+        logger.error(f"Error scraping with Playwright for '{url}': {e}", exc_info=True)
+        # Attempt to close the page if an error occurred before explicit close
+        if 'page' in locals() and not page.is_closed():
+            await page.close()
+        product_info["title"] = "❌ Unable to extract title"
+        product_info["price"] = "N/A"
+        product_info["sizes"] = "N/A"
+        product_info["pin"] = "N/A"
+    
     return product_info
+
+# --- Celery Task Definition ---
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=300)
+async def process_deal_task(self, chat_id: int, link: str, message_caption: str | None = None) -> None:
+    """
+    Celery task to handle the full deal processing pipeline (unshorten, strip, scrape, format, send).
+    This runs in the background, separate from the Flask webhook.
+    """
+    try:
+        # 1. Unshorten the URL
+        unshortened_link = await unshorten_url(link)
+        
+        # 2. Strip affiliate tags from the unshortened link
+        clean_link = strip_affiliate_tags(unshortened_link)
+        
+        # 3. Scrape product information using Playwright
+        product_data = await scrape_product_info_playwright(clean_link, message_caption)
+
+        # 4. Format the output string as per specified structure
+        formatted_lines = []
+
+        display_title = product_data["title"]
+        display_title = re.sub(r'\[(Men|Women|Kids|Unisex|Pack of|Set of|Pcs|Kg|Ml|G|Quantity)\]\s*', '', display_title, flags=re.IGNORECASE).strip()
+
+        final_prefixes = []
+        for tag in GENDER_TAGS:
+            if re.search(r'\b' + re.escape(tag) + r'\b', display_title, re.IGNORECASE):
+                final_prefixes.append(tag.capitalize())
+                display_title = re.sub(r'\b' + re.escape(tag) + r'\b', '', display_title, flags=re.IGNORECASE).strip()
+                break
+        for tag in QUANTITY_TAGS:
+            if re.search(r'\b' + re.escape(tag) + r'\b', display_title, re.IGNORECASE):
+                final_prefixes.append(tag.capitalize())
+                display_title = re.sub(r'\b' + re.escape(tag) + r'\b', '', display_title, flags=re.IGNORECASE).strip()
+                break
+        
+        final_output_title = " ".join(final_prefixes + [display_title.strip()]).strip()
+
+        formatted_lines.append(f"{final_output_title} @{product_data['price']} rs")
+        formatted_lines.append(product_data['link'])
+
+        if product_data["sizes"] != "N/A" and product_data["sizes"] != "Not Found":
+            formatted_lines.append(f"\nSize - {product_data['sizes']}")
+        else:
+            logger.info("Skipping 'Size' line as no valid sizes were found.")
+
+        if "meesho.com" in clean_link and product_data["pin"] != "N/A":
+            formatted_lines.append(f"Pin - {product_data['pin']}")
+        else:
+            logger.info("Skipping 'Pin' line as it's not a Meesho link or pin is N/A.")
+        
+        formatted_lines.append("\n@reviewcheckk")
+
+        final_response = "\n".join(formatted_lines)
+        
+        # Send the response back to Telegram
+        await application.bot.send_message(chat_id=chat_id, text=final_response)
+
+    except Exception as e:
+        logger.exception(f"Celery task failed for chat ID {chat_id}, link '{link}': {e}")
+        try:
+            # Attempt to retry the task if it's a recoverable error
+            raise self.retry(exc=e)
+        except self.MaxRetriesExceededError:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text="❌ I tried my best, but couldn't process this link after multiple attempts. "
+                     "The website might be tricky or there's a temporary issue. Please try another link. 🚧"
+            )
 
 # --- Telegram Handlers ---
 
@@ -304,21 +406,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def process_product_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles incoming messages (text, photos with captions, forwarded messages).
-    Extracts links, offloads scraping, and sends the formatted deal.
+    Handles incoming messages, extracts links, and dispatches scraping to Celery.
+    Responds immediately to Telegram to prevent webhook timeouts.
     """
     message = update.message
-    message_text = message.text or message.caption # Get text from message or photo caption
+    message_text = message.text or message.caption
 
     if not message_text:
-        # If no text/caption, but it's a forwarded message, check for image-only case.
         if message.forward_from or message.forward_sender_name:
              if message.photo:
                 logger.info("Forwarded message with image detected, but no text/caption. Attempting to extract link from image metadata or external sources if possible (not implemented).")
                 await message.reply_text("🔎 Trying to analyze the image... (Note: Image-only link detection is limited.)")
-                # For image-only processing without text, you'd need advanced image OCR/recognition here
-                # which is out of scope for this basic setup.
-                # For now, if no link is found later, it will give "No link detected."
              else:
                 await message.reply_text("⚠️ No product link detected in the message.")
                 return
@@ -326,7 +424,6 @@ async def process_product_link(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text("⚠️ No product link detected in the message.")
             return
 
-    # Try to extract product link from message entities (e.g., actual text links, URLs)
     product_link = None
     if message.entities:
         for entity in message.entities:
@@ -337,7 +434,6 @@ async def process_product_link(update: Update, context: ContextTypes.DEFAULT_TYP
                 product_link = message_text[entity.offset : entity.offset + entity.length]
                 break
     
-    # If no link found via entities, try regex on full message text
     if not product_link:
         product_link = extract_product_link(message_text)
 
@@ -346,86 +442,14 @@ async def process_product_link(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info(f"No product link detected in message from chat ID: {update.effective_chat.id}")
         return
 
-    await message.reply_text("⏳ Processing your link... Please wait a moment. 🚀")
-    logger.info(f"Detected link: '{product_link}' from chat ID: {update.effective_chat.id}")
+    # Acknowledge immediately to prevent Telegram webhook timeout
+    await message.reply_text("⏳ Processing your link... This might take a moment. 🚀")
+    logger.info(f"Detected link: '{product_link}' from chat ID: {update.effective_chat.id}. Dispatching task.")
 
-    try:
-        # Offload the heavy scraping and formatting work to an asyncio task.
-        # This is CRUCIAL to prevent the Flask webhook from timing out (Telegram's limit is 10 seconds).
-        # For very high load or extremely long scraping tasks, consider a dedicated
-        # message queue system like Celery/RQ with separate worker processes.
-        formatted_deal_info = await scrape_and_format_deal(product_link, message.caption)
-        await message.reply_text(formatted_deal_info)
-    except Exception as e:
-        logger.exception(f"❌ Unhandled error processing link '{product_link}': {e}")
-        await message.reply_text("❌ Oh no! I hit a snag and couldn't extract the product info. Please try again later. 🚧")
-
-async def scrape_and_format_deal(link: str, caption: str | None = None) -> str:
-    """
-    Orchestrates the entire process: unshortening, stripping, scraping, and formatting.
-    """
-    try:
-        # 1. Unshorten the URL
-        unshortened_link = await unshorten_url(link)
-        
-        # 2. Strip affiliate tags from the unshortened link
-        clean_link = strip_affiliate_tags(unshortened_link)
-        
-        # 3. Scrape product information from the cleaned link
-        product_data = await scrape_product_info(clean_link, caption)
-
-        # 4. Format the output string as per specified structure
-        formatted_lines = []
-
-        # [Gender] [Quantity] [Title] @[price] rs
-        # Ensure title cleaning matches output rules
-        display_title = product_data["title"]
-        
-        # Remove any bracketed tags used for internal identification by scraper, if any
-        display_title = re.sub(r'\[(Men|Women|Kids|Unisex|Pack of|Set of|Pcs|Kg|Ml|G|Quantity)\]\s*', '', display_title, flags=re.IGNORECASE).strip()
-
-        # Re-apply prefixes as standalone words if they were found during scraping.
-        # This requires checking the original scraped data or re-deriving.
-        # For simplicity, if the scraper already prefixed, it's there.
-        # If the title still contains raw gender/quantity words, let's prepend them cleanly.
-        final_prefixes = []
-        for tag in GENDER_TAGS:
-            if re.search(r'\b' + re.escape(tag) + r'\b', display_title, re.IGNORECASE):
-                final_prefixes.append(tag.capitalize())
-                display_title = re.sub(r'\b' + re.escape(tag) + r'\b', '', display_title, flags=re.IGNORECASE).strip()
-                break # Add only one gender tag
-        for tag in QUANTITY_TAGS:
-            if re.search(r'\b' + re.escape(tag) + r'\b', display_title, re.IGNORECASE):
-                final_prefixes.append(tag.capitalize())
-                display_title = re.sub(r'\b' + re.escape(tag) + r'\b', '', display_title, flags=re.IGNORECASE).strip()
-                break # Add only one quantity tag
-        
-        # Join prefixes and title
-        final_output_title = " ".join(final_prefixes + [display_title.strip()]).strip()
-
-        formatted_lines.append(f"{final_output_title} @{product_data['price']} rs")
-        formatted_lines.append(product_data['link'])
-
-        # Size - [sizes] (skip if not found)
-        if product_data["sizes"] != "N/A" and product_data["sizes"] != "Not Found":
-            formatted_lines.append(f"\nSize - {product_data['sizes']}") # Add newline for separation
-        else:
-            logger.info("Skipping 'Size' line as no valid sizes were found.")
-
-        # Pin - [pin] (only for meesho.com links)
-        if "meesho.com" in clean_link and product_data["pin"] != "N/A":
-            formatted_lines.append(f"Pin - {product_data['pin']}") # No extra newline, will follow Size or Title
-        else:
-            logger.info("Skipping 'Pin' line as it's not a Meesho link or pin is N/A.")
-        
-        # Always end with @reviewcheckk
-        formatted_lines.append("\n@reviewcheckk") # Ensure this is always the last line with a preceding newline
-
-        return "\n".join(formatted_lines)
-
-    except Exception as e:
-        logger.exception(f"Error in scrape_and_format_deal for link '{link}': {e}")
-        return "❌ Oops! Something went wrong while preparing the deal information. Please try again or with a different link. 🤖"
+    # Dispatch the heavy processing to Celery.
+    # We pass chat_id so the Celery task knows where to send the final response.
+    # Pass message.caption if available, for prioritized title extraction.
+    process_deal_task.delay(update.effective_chat.id, product_link, message.caption)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log any errors and send a generic error message to the user."""
@@ -438,13 +462,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --- Register Handlers ---
 def setup_handlers(app_instance: Application):
     """Register all bot handlers with the Telegram Application instance."""
-    app_instance.add_handler(MessageHandler(filters.COMMAND, start)) # Handles /start command
+    app_instance.add_handler(MessageHandler(filters.COMMAND, start))
     app_instance.add_handler(MessageHandler(
-        # Filters for text messages, photos with captions, and any forwarded messages
         filters.TEXT | filters.PHOTO & filters.FORWARDED | filters.FORWARDED & filters.TEXT | filters.FORWARDED & filters.CAPTION,
         process_product_link
     ))
-    app_instance.add_error_handler(error_handler) # Catches all unhandled exceptions
+    app_instance.add_error_handler(error_handler)
 
 # --- Flask Webhook Route ---
 @app.route(WEBHOOK_PATH, methods=["POST"])
@@ -457,35 +480,31 @@ async def webhook_handler():
         update_json = request.get_json()
         if not update_json:
             logger.warning("Received empty or invalid JSON from webhook.")
-            abort(400) # Bad Request
+            abort(400)
 
         try:
-            # Create a Telegram Update object from the JSON payload
             update = Update.de_json(update_json, application.bot)
-            # Process the update. This is asynchronous, allowing the webhook to return quickly.
             await application.process_update(update)
-            return "ok" # Telegram expects a 200 OK response
+            return "ok"
         except Exception as e:
             logger.error(f"Error processing Telegram update in webhook: {e}", exc_info=True)
-            abort(500) # Indicate an internal server error to Telegram, though "ok" is often fine too.
-    return "ok" # For GET requests or other methods, just return ok
+            abort(500)
+    return "ok"
 
 # --- Main Application Logic (for local testing or Render's initial setup) ---
 if __name__ == '__main__':
-    # This block is for local development testing or to run a one-time webhook setup.
-    # In a Render production deployment, Gunicorn (defined in Procfile) will start the 'app' Flask instance.
+    # This block is primarily for local testing where you might run `python app.py`.
+    # For Render production, Gunicorn will start the 'app' Flask instance, and Celery will be started by 'celery -A app.celery_app worker'.
 
     # 1. Set up all Telegram bot handlers
     setup_handlers(application)
 
     # 2. Set the webhook URL on Telegram's side.
     # This should typically be a one-time operation during deployment or a pre-deploy hook on Render.
-    # Running it every time the Flask app starts is generally fine but not strictly necessary after first successful setup.
     async def set_webhook_on_startup():
         try:
             full_webhook_url = f"{WEBHOOK_URL_BASE.rstrip('/')}{WEBHOOK_PATH}"
             logger.info(f"Attempting to set webhook to: {full_webhook_url}")
-            # allowed_updates=Update.ALL_TYPES ensures you receive all types of updates
             await application.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
             logger.info("Webhook set successfully!")
         except Exception as e:
@@ -494,6 +513,6 @@ if __name__ == '__main__':
     # Run the webhook setup asynchronously
     asyncio.run(set_webhook_on_startup())
 
-    # This line is primarily for local testing where you might run `python app.py`.
-    # For Render production, Gunicorn will manage the Flask application process (`gunicorn app:app`).
+    # In local development, you might run Flask directly:
     # app.run(debug=True, port=8000)
+    # In production on Render, Gunicorn (from Procfile) will handle running app.
