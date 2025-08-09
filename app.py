@@ -1,3 +1,5 @@
+Python
+
 import os
 import logging
 import pandas as pd
@@ -103,9 +105,20 @@ def set_webhook():
 def main():
     file_path = 'data.csv'
     target_column = 'target'
+Python
 
-    df = load_data(file_path)
-    df = preprocess_data(df)
-    X_train, X_test, y_train, y_test = split_data(df, target_column)
-    X_train_scaled, X_test_scaled = scale_features(X_train, X_test)
-    model = train_model(X_train_scaled, y_train)
+df = load_data(file_path)
+df = preprocess_data(df)
+X_train, X_test, y_train, y_test = split_data(df, target_column)
+X_train_scaled, X_test_scaled = scale_features(X_train, X_test)
+model = train_model(X_train_scaled, y_train)
+mse, r2, y_pred = evaluate_model(model, X_test_scaled, y_test)
+
+logger.info(f"Mean Squared Error: {mse}")
+logger.info(f"R^2 Score: {r2}")
+
+plot_results(y_test, y_pred)
+
+if name == 'main':
+    main()
+    app.run(host="0.0.0.0", port=5000)
