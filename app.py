@@ -21,7 +21,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 
 # ---------- Configuration ----------
 # DO NOT hardcode token here. Set BOT_TOKEN in Render environment variables.
-BOT_TOKEN = os.environ.get("8465346144:AAGSHC77UkXVZZTUscbYItvJxgQbBxmFcWo")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Your provided webhook base (safe to include); can be overridden via env var.
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "https://auto-flow-k6sb.onrender.com")
 PORT = int(os.environ.get("PORT", "8080"))
