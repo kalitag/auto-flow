@@ -1,142 +1,142 @@
-    # app.py
-    import os
-    import re
-    import asyncio
-    import logging
-    from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+# app.py
+import os
+import re
+import asyncio
+import logging
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
-    import requests
-    from bs4 import BeautifulSoup
-    from flask import Flask, request, abort
-    from telegram import Update
-    from telegram.ext import Application, MessageHandler, filters, ContextTypes
-    from playwright.async_api import async_playwright, Playwright
-    from celery import Celery
-    from celery.signals import worker_process_init, worker_process_shutdown
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request, abort
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from playwright.async_api import async_playwright, Playwright
+from celery import Celery
+from celery.signals import worker_process_init, worker_process_shutdown
 
-    # --- Configuration ---
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-    )
-    logger = logging.getLogger(__name__)
+# --- Configuration ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-    BOT_TOKEN = os.getenv("BOT_TOKEN") # Get from Render environment variables
-    WEBHOOK_URL_BASE = os.getenv("WEBHOOK_URL_BASE") # Get from Render environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN") # Get from Render environment variables
+WEBHOOK_URL_BASE = os.getenv("WEBHOOK_URL_BASE") # Get from Render environment variables
 
-    # Ensure BOT_TOKEN is set before proceeding
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is not set. Bot will not function correctly.")
-        # Exit or handle this more gracefully depending on desired behavior.
-        # For a web app, it's fine if it launches, but bot functions will fail.
+# Ensure BOT_TOKEN is set before proceeding
+if not BOT_TOKEN:
+    logger.critical("BOT_TOKEN environment variable is not set. Bot will not function correctly.")
+    # Exit or handle this more gracefully depending on desired behavior.
+    # For a web app, it's fine if it launches, but bot functions will fail.
 
-    WEBHOOK_PATH = f"/{BOT_TOKEN}" if BOT_TOKEN else "/dummy_path" # Use dummy if token missing
+WEBHOOK_PATH = f"/{BOT_TOKEN}" if BOT_TOKEN else "/dummy_path" # Use dummy if token missing
 
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0") 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0") 
 
-    SUPPORTED_SHORTENERS = [
-        "cutt.ly", "spoo.me", "amzn-to.co", "fkrt.cc", "bitli.in", "da.gd", "wishlink.com"
-    ]
+SUPPORTED_SHORTENERS = [
+    "cutt.ly", "spoo.me", "amzn-to.co", "fkrt.cc", "bitli.in", "da.gd", "wishlink.com"
+]
 
-    AFFILIATE_PARAMS = [
-        "tag", "ref", "aff_id", "partner_id", "linkCode", "camp", "creative",
-        "creativeASIN", "ascsubtag", "utm_source", "utm_medium", "utm_campaign",
-        "fbclid", "_encoding", "psc", "coliid", "colid", "sr_p_7"
-    ]
+AFFILIATE_PARAMS = [
+    "tag", "ref", "aff_id", "partner_id", "linkCode", "camp", "creative",
+    "creativeASIN", "ascsubtag", "utm_source", "utm_medium", "utm_campaign",
+    "fbclid", "_encoding", "psc", "coliid", "colid", "sr_p_7"
+]
 
-    PRICE_PATTERN = re.compile(r'[₹Rs]{1,2}\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', re.IGNORECASE)
+PRICE_PATTERN = re.compile(r'[₹Rs]{1,2}\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', re.IGNORECASE)
 
-    GENDER_TAGS = ["men", "women", "kids", "unisex"]
-    QUANTITY_TAGS = ["pack of", "set of", "pcs", "kg", "ml", "g", "quantity"]
+GENDER_TAGS = ["men", "women", "kids", "unisex"]
+QUANTITY_TAGS = ["pack of", "set of", "pcs", "kg", "ml", "g", "quantity"]
 
-    MEESHO_FALLBACK_PIN = "110001"
+MEESHO_FALLBACK_PIN = "110001"
 
-    # --- Flask App Initialization ---
-    app = Flask(__name__)
+# --- Flask App Initialization ---
+app = Flask(__name__)
 
-    # --- Celery App Initialization ---
-    celery_app = Celery(
-        "deal_bot_tasks",
-        broker=REDIS_URL,
-        backend=REDIS_URL,
-        include=['app']
-    )
+# --- Celery App Initialization ---
+celery_app = Celery(
+    "deal_bot_tasks",
+    broker=REDIS_URL,
+    backend=REDIS_URL,
+    include=['app']
+)
 
-    playwright_context = {}
+playwright_context = {}
 
-    @worker_process_init.connect
-    def init_playwright(**kwargs):
-        """Initializes Playwright browser context when a Celery worker process starts."""
-        global playwright_context
-        logger.info("Initializing Playwright in Celery worker process.")
-        # Celery workers already have an event loop, so we run the async part in a new task.
-        # This prevents blocking the worker's startup.
-        async def _init_playwright_async_wrapper():
-            try:
-                pw = await async_playwright().start()
-                playwright_context['pw'] = pw
-                playwright_context['browser'] = await pw.chromium.launch(headless=True)
-                logger.info("Playwright browser launched successfully.")
-            except Exception as e:
-                logger.error(f"Failed to launch Playwright browser in worker: {e}", exc_info=True)
-                # Depending on severity, might re-raise or set a flag to skip Playwright tasks
-                raise # Re-raise to ensure worker doesn't start in a broken state
-
-        asyncio.get_event_loop().run_until_complete(_init_playwright_async_wrapper())
-
-
-    @worker_process_shutdown.connect
-    def close_playwright(**kwargs):
-        """Closes Playwright browser context when a Celery worker process shuts down."""
-        global playwright_context
-        if 'browser' in playwright_context and playwright_context['browser']:
-            logger.info("Closing Playwright browser in Celery worker process.")
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(playwright_context['browser'].close())
-            loop.run_until_complete(playwright_context['pw'].stop())
-            logger.info("Playwright browser closed.")
-
-    # --- Telegram Bot Application Initialization ---
-    # Initialize with the bot token. This `application` instance is used by both Flask and Celery.
-    application = Application.builder().token(BOT_TOKEN).arbitrary_callback_data(True).build()
-
-
-    # --- Utility Functions ---
-
-    def extract_product_link(message_text: str) -> str | None:
-        url_pattern = re.compile(
-            r'(https?://(?:www\.)?|www\.)?'
-            r'(?:[a-zA-Z0-9-]+\.)+'
-            r'[a-zA-Z]{2,6}'
-            r'(?:/[^\s]*)?'
-        )
-        match = url_pattern.search(message_text)
-        if match:
-            url = match.group(0)
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url if url.startswith('www.') else 'https://' + url
-            logger.info(f"Extracted initial URL: {url}")
-            return url
-        return None
-
-    async def unshorten_url(short_url: str) -> str:
-        parsed_url = urlparse(short_url)
-        if not parsed_url.netloc:
-            logger.warning(f"Invalid URL for unshortening (no netloc): {short_url}")
-            return short_url
-
-        if not any(shortener in parsed_url.netloc for shortener in SUPPORTED_SHORTENERS):
-            logger.info(f"URL '{short_url}' is not from a known shortener. Skipping unshorten.")
-            return short_url
-
+@worker_process_init.connect
+def init_playwright(**kwargs):
+    """Initializes Playwright browser context when a Celery worker process starts."""
+    global playwright_context
+    logger.info("Initializing Playwright in Celery worker process.")
+    # Celery workers already have an event loop, so we run the async part in a new task.
+    # This prevents blocking the worker's startup.
+    async def _init_playwright_async_wrapper():
         try:
-            response = requests.head(short_url, allow_redirects=True, timeout=10)
-            response.raise_for_status()
-            final_url = response.url
-            logger.info(f"Unshortened '{short_url}' to '{final_url}'")
-            return final_url
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error unshortening URL '{short_url}': {e}")
-            return short_url
+            pw = await async_playwright().start()
+            playwright_context['pw'] = pw
+            playwright_context['browser'] = await pw.chromium.launch(headless=True)
+            logger.info("Playwright browser launched successfully.")
+        except Exception as e:
+            logger.error(f"Failed to launch Playwright browser in worker: {e}", exc_info=True)
+            # Depending on severity, might re-raise or set a flag to skip Playwright tasks
+            raise # Re-raise to ensure worker doesn't start in a broken state
+
+    asyncio.get_event_loop().run_until_complete(_init_playwright_async_wrapper())
+
+
+@worker_process_shutdown.connect
+def close_playwright(**kwargs):
+    """Closes Playwright browser context when a Celery worker process shuts down."""
+    global playwright_context
+    if 'browser' in playwright_context and playwright_context['browser']:
+        logger.info("Closing Playwright browser in Celery worker process.")
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(playwright_context['browser'].close())
+        loop.run_until_complete(playwright_context['pw'].stop())
+        logger.info("Playwright browser closed.")
+
+# --- Telegram Bot Application Initialization ---
+# Initialize with the bot token. This `application` instance is used by both Flask and Celery.
+application = Application.builder().token(BOT_TOKEN).arbitrary_callback_data(True).build()
+
+
+# --- Utility Functions ---
+
+def extract_product_link(message_text: str) -> str | None:
+    url_pattern = re.compile(
+        r'(https?://(?:www\.)?|www\.)?'
+        r'(?:[a-zA-Z0-9-]+\.)+'
+        r'[a-zA-Z]{2,6}'
+        r'(?:/[^\s]*)?'
+    )
+    match = url_pattern.search(message_text)
+    if match:
+        url = match.group(0)
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url if url.startswith('www.') else 'https://' + url
+        logger.info(f"Extracted initial URL: {url}")
+        return url
+    return None
+
+async def unshorten_url(short_url: str) -> str:
+    parsed_url = urlparse(short_url)
+    if not parsed_url.netloc:
+        logger.warning(f"Invalid URL for unshortening (no netloc): {short_url}")
+        return short_url
+
+    if not any(shortener in parsed_url.netloc for shortener in SUPPORTED_SHORTENERS):
+        logger.info(f"URL '{short_url}' is not from a known shortener. Skipping unshorten.")
+        return short_url
+
+    try:
+        response = requests.head(short_url, allow_redirects=True, timeout=10)
+        response.raise_for_status()
+        final_url = response.url
+        logger.info(f"Unshortened '{short_url}' to '{final_url}'")
+        return final_url
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error unshortening URL '{short_url}': {e}")
+        return short_url
 
     def strip_affiliate_tags(url: str) -> str:
         parsed_url = urlparse(url)
@@ -420,4 +420,3 @@
         setup_handlers(application)
         # Run the bot in polling mode (continuously check for updates)
         application.run_polling(poll_interval=1.0, timeout=30)
-    
