@@ -1,10 +1,6 @@
-Flask
+Flask==3.0.0
 python-telegram-bot==20.6
-requests
-beautifulsoup4
-lxml
-
-Advanced features for robust scraping and asynchronous tasks
-playwright==1.45.0
-celery==5.3.6
-redis==5.0.1
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+gunicorn==21.2.0
