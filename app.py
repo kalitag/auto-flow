@@ -3,101 +3,100 @@ import re
 import requests
 from flask import Flask, request
 from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes
 from bs4 import BeautifulSoup
 
+# Flask app init
 app = Flask(__name__)
 
+# Environment variables from Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 bot = Bot(token=BOT_TOKEN)
 
-
-# --- Short link ko unshort karne ka function ---
-def unshorten_url(url):
+# Function: unshort any short URL
+def unshort_url(url):
     try:
-        session = requests.Session()
-        resp = session.head(url, allow_redirects=True, timeout=10)
+        resp = requests.head(url, allow_redirects=True, timeout=10)
         return resp.url
-    except Exception:
+    except:
         return url
 
-
-# --- Product details scrape karne ka function ---
+# Function: scrape product details
 def scrape_product(url):
     try:
         r = requests.get(url, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        title = soup.find("h1")
-        price = soup.find(string=re.compile(r"₹"))
-        sizes = [s.get_text(strip=True) for s in soup.find_all("span") if re.search(r"\b[XSML\d]", s.get_text())]
+        title = soup.find("title").text.strip() if soup.find("title") else "N/A"
+        price = None
+        for tag in soup.find_all(text=re.compile(r"₹\s?\d+")):
+            price = tag.strip()
+            break
 
         return {
-            "title": title.get_text(strip=True) if title else None,
-            "price": price.strip() if price else None,
-            "sizes": sizes if sizes else None
+            "title": title,
+            "price": price if price else "N/A",
+            "url": url
         }
     except Exception as e:
         return {"error": str(e)}
 
+# Detect gender and quantity
+def detect_gender_quantity(text):
+    gender = "Unknown"
+    quantity = "Unknown"
 
-# --- Gender detect ---
-def detect_gender(text):
-    text = text.lower()
-    if "men" in text or "male" in text:
-        return "Men"
-    elif "women" in text or "female" in text:
-        return "Women"
-    return None
+    if re.search(r"\b(men|male|boy)\b", text, re.I):
+        gender = "Male"
+    elif re.search(r"\b(women|female|girl)\b", text, re.I):
+        gender = "Female"
 
+    qty_match = re.search(r"\b(\d+)\s?(pcs|pieces|item|qty)?\b", text, re.I)
+    if qty_match:
+        quantity = qty_match.group(1)
 
-# --- Quantity detect ---
-def detect_quantity(text):
-    match = re.search(r"\b(\d+)\b", text)
-    return int(match.group(1)) if match else None
+    return gender, quantity
 
-
-# --- Telegram message handler ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    # Short link detect
-    url_match = re.search(r"https?://\S+", text)
-    if not url_match:
-        await update.message.reply_text("Koi product link nahi mila.")
-        return
-
-    short_url = url_match.group(0)
-    full_url = unshorten_url(short_url)
-
-    # Scrape product
-    product_data = scrape_product(full_url)
-
-    # Extra info
-    product_data["gender"] = detect_gender(text)
-    product_data["quantity"] = detect_quantity(text)
-    product_data["url"] = full_url
-
-    await update.message.reply_text(f"```json\n{product_data}\n```", parse_mode="Markdown")
-
-
-# --- Flask webhook route ---
+# Telegram webhook endpoint
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
-    application.update_queue.put_nowait(update)
+    message_text = update.message.text
+
+    # Extract first URL
+    urls = re.findall(r'(https?://\S+)', message_text)
+    if not urls:
+        update.message.reply_text("❌ No URL found in your message.")
+        return "ok"
+
+    # Process first URL
+    short_url = urls[0]
+    final_url = unshort_url(short_url)
+
+    # Scrape
+    product_data = scrape_product(final_url)
+
+    # Detect gender & quantity
+    gender, quantity = detect_gender_quantity(message_text)
+
+    # Build reply JSON
+    reply_data = {
+        "gender": gender,
+        "quantity": quantity,
+        "product": product_data
+    }
+
+    update.message.reply_text(f"✅ Data:\n```{reply_data}```", parse_mode="Markdown")
+
     return "ok"
 
+# Set webhook automatically
+@app.before_first_request
+def set_webhook():
+    bot.delete_webhook()
+    bot.set_webhook(f"{WEBHOOK_URL}/webhook")
 
 if __name__ == "__main__":
-    # Telegram bot app
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Set webhook
-    bot.set_webhook(WEBHOOK_URL)
-
-    # Run Flask
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=10000)
