@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: auto-flow
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: BOT_TOKEN
+        value: 8465346144:AAGSHC77UkXVZZTUscbYItvJxgQbBxmFcWo
+      - key: WEBHOOK_URL
+        value: https://auto-flow-k6sb.onrender.com
+    autoDeploy: true
+    healthCheckPath: /
