@@ -30,12 +30,10 @@ async def set_webhook_on_startup():
     try:
         full_webhook_url = f"{WEBHOOK_URL_BASE.rstrip('/')}{WEBHOOK_PATH}"
         logger.info(f"Attempting to set webhook to: {full_webhook_url}")
-        # Use allowed_updates=Update.ALL_TYPES to ensure all message types are received
         await application.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
         logger.info("Webhook set successfully!")
     except Exception as e:
         logger.critical(f"Failed to set webhook on Telegram! Bot will not receive updates. Error: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    # Ensure this script is run as part of your Render Pre-deploy command.
     asyncio.run(set_webhook_on_startup())
